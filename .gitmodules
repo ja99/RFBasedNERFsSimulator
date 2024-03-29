@@ -1,0 +1,4 @@
+[submodule "fdtd"]
+	path = fdtd
+	url = https://github.com/ja99/fdtd.git
+	branch = custom-branch
