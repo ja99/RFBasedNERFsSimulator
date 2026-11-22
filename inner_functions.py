@@ -1,111 +1,98 @@
-from typing import List, Tuple
+from typing import List, NamedTuple, Tuple
 
 import numpy as np
-from torch import multiprocessing as mp
-from tqdm import tqdm
-import WorldObjectType
+
+from SDF import coordinate_roundoff
+from WorldObjectType import WorldObject
 
 
-def min_dist_to_obj(objects: List[WorldObjectType.WorldObject], point: np.ndarray) -> (float, int):
-    distances = [obj.sdf.sdf(point) for obj in objects]
-    d = min(distances)
-    obj_id = distances.index(d)
-    return d, obj_id
+class MaterialRun(NamedTuple):
+    x: int
+    y: int
+    z_start: int
+    z_stop: int
+    name: str
+    permittivity: float
+    conductivity: float
 
 
-def add_objects_to_grid_inner(objects: List[WorldObjectType.WorldObject],
-                              objects_queue: mp.Queue,
-                              subgrid_queue: mp.Queue,
-                              kill_me_queue: mp.Queue,
-                              subgrid_q_lock: mp.Lock,
-                              kill_me_q_lock: mp.Lock,
-                              process_id: int,
-                              x_range: Tuple[int, int],
-                              y_range: Tuple[int, int],
-                              z_range: Tuple[int, int],
-                              ):
-    export_grid = np.zeros((x_range[1] - x_range[0], y_range[1] - y_range[0], z_range[1] - z_range[0], 3))
+def _sampled_distances(shape, points):
+    distance = shape.distances(points)
+    if not np.isfinite(distance).all():
+        raise ValueError("An object returned a non-finite signed distance")
+    tolerance = coordinate_roundoff(shape.get_bounding_box())
+    return np.where(np.abs(distance) <= tolerance, 0.0, distance)
 
-    in_region = False
-    current_obj = -1
-    z_start = -1
 
-    for x in tqdm(range(x_range[0], x_range[1]), desc=f"Process {process_id}"):
-        for y in range(y_range[0], y_range[1]):
-            for z in range(z_range[0], z_range[1]):
-                d, obj_i = min_dist_to_obj(objects, np.array([x, y, z]))
+def min_dist_to_obj(objects: List[WorldObject], point: np.ndarray) -> Tuple[float, int]:
+    if not objects:
+        return np.inf, -1
+    distances = [float(_sampled_distances(obj.sdf, point)) for obj in objects]
+    nearest = int(np.argmin(distances))
+    return distances[nearest], nearest
 
-                # outside the object
-                if 0 < d:
-                    export_grid[x - x_range[0], y - y_range[0], z - z_range[0]] = np.array([1.0, 1.0, d])
-                    if in_region:
-                        in_region = False
-                        z_end = z
-                        objects_queue.put(
-                            (
-                                x,
-                                y,
-                                z_start,
-                                z_end,
-                                f"{x},{y},{z_start}:{z_end},",
-                                float(objects[current_obj].permittivity),
-                                float(objects[current_obj].conductivity)
-                            )
-                        )
-                # inside the object
-                elif d < 0:
-                    export_grid[x - x_range[0], y - y_range[0], z - z_range[0]] = np.array(
-                        [float(objects[obj_i].permittivity),
-                         float(objects[obj_i].conductivity),
-                         d])
 
-                    if not in_region:
-                        in_region = True
-                        current_obj = obj_i
-                        z_start = z
+def voxelize_slab(objects, x_range, y_range, z_range, background_permittivity=1.0,
+                  background_inverse=None, material_dtype=np.float64):
+    """Sample cell centers and derive FDTD material runs from their ownership."""
+    if background_inverse is None:
+        background_inverse = np.reciprocal(np.asarray(background_permittivity, dtype=float))
+    axes = [np.arange(start, stop) for start, stop in (x_range, y_range, z_range)]
+    points = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1)
+    shape = points.shape[:-1]
+    labels = np.empty((*shape, 3), dtype=np.float64)
+    labels[..., 0] = background_permittivity
+    labels[..., 1] = 0.0
+    distance = labels[..., 2]
+    distance.fill(np.inf)
+    owners = np.full(shape, -1, dtype=np.int32)
+    present = np.zeros(len(objects), dtype=bool)
 
-                    if in_region and obj_i != current_obj:
-                        z_end = z
-                        objects_queue.put(
-                            (
-                                x,
-                                y,
-                                z_start,
-                                z_end,
-                                f"{x},{y},{z_start}:{z_end},",
-                                float(objects[current_obj].permittivity),
-                                float(objects[current_obj].conductivity)
-                            )
-                        )
-                        current_obj = obj_i
-                        z_start = z
+    for index, obj in enumerate(objects):
+        candidate = _sampled_distances(obj.sdf, points)
+        closer = candidate < distance
+        distance[closer] = candidate[closer]
+        inside = candidate < 0
+        occupied = closer & inside
+        # Legacy scenes may wrap scalars in one-element NumPy arrays or Torch tensors.
+        values = [v.item() if hasattr(v, "item") else v for v in (obj.permittivity, obj.conductivity)]
+        eps, sigma = np.asarray(values, dtype=material_dtype)
+        if not np.isfinite([eps, sigma]).all():
+            raise ValueError("Material permittivity and conductivity must be finite")
+        # Compare the inverse coefficient used by FDTD. Taking its reciprocal
+        # to label the background can shift nominal epsilon by one ulp.
+        inverse_epsilon = np.reciprocal(np.asarray(eps, dtype=background_inverse.dtype))
+        has_contrast = (inverse_epsilon != background_inverse) | (sigma != 0)
+        present[index] = (inside & has_contrast).any()
+        np.copyto(owners, np.where(has_contrast, index, -1), where=occupied)
+        np.copyto(labels[..., 0], np.where(has_contrast, eps, background_permittivity), where=occupied)
+        labels[..., 1][occupied] = sigma
 
-                    if z == z_range[1] - 1:
-                        z_end = z_range[1]
-                        objects_queue.put(
-                            (
-                                x,
-                                y,
-                                z_start,
-                                z_end,
-                                f"{x},{y},{z_start}:{z_end},",
-                                float(objects[current_obj].permittivity),
-                                float(objects[current_obj].conductivity)
-                            )
-                        )
-                        current_obj = -1
-                        z_start = -1
-                        in_region = False
+    runs = []
+    for local_x, local_y in np.argwhere((owners >= 0).any(axis=-1)):
+        x = int(local_x) + x_range[0]
+        y = int(local_y) + y_range[0]
+        row = owners[local_x, local_y]
+        # Air sentinels close each row, including an object touching its last cell.
+        edges = np.flatnonzero(np.diff(row, prepend=-1, append=-1))
+        for start, stop in zip(edges[:-1], edges[1:]):
+            if row[start] >= 0:
+                z_start = z_range[0] + int(start)
+                z_stop = z_range[0] + int(stop)
+                eps, sigma = labels[local_x, local_y, start, :2]
+                runs.append(MaterialRun(x, y, z_start, z_stop, f"{x},{y},{z_start}:{z_stop},",
+                                        float(eps), float(sigma)))
+    return labels, runs, present
 
+
+def add_objects_to_grid_inner(objects, objects_queue, subgrid_queue, kill_me_queue,
+                              subgrid_q_lock, kill_me_q_lock, process_id,
+                              x_range, y_range, z_range):
+    """Queue-based entry point for archived simulator drivers."""
+    labels, runs, _ = voxelize_slab(objects, x_range, y_range, z_range)
+    for run in runs:
+        objects_queue.put(run)
     with subgrid_q_lock:
-        subgrid_queue.put((x_range, y_range, export_grid))
-
-    # somehow processes wouldn't die, so I had to do this
+        subgrid_queue.put((x_range, y_range, labels))
     with kill_me_q_lock:
         kill_me_queue.put(process_id)
-
-    print(f"Process {process_id} finished")
-
-
-
-

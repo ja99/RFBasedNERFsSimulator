@@ -3,11 +3,8 @@ from datetime import datetime
 import numpy as np
 
 
-def rotate_vec(vec: np.ndarray,  # [x, y, z]
-               roll: float,  # degrees
-               pitch: float,  # degrees
-               yaw: float  # degrees
-               ) -> np.ndarray:  # [x, y, z]
+def rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """Local-to-world rotation for roll, pitch and yaw in degrees."""
     # Convert angles from degrees to radians
     roll = np.radians(roll)
     pitch = np.radians(pitch)
@@ -25,12 +22,11 @@ def rotate_vec(vec: np.ndarray,  # [x, y, z]
                    [0.0, 0.0, 1.0]], dtype=np.float64)
 
     # Compute total rotation matrix
-    R = np.matmul(np.matmul(Rz, Ry), Rx)
+    return Rz @ Ry @ Rx
 
-    # Rotate vector
-    rotated_vec = np.matmul(R, vec)
 
-    return rotated_vec
+def rotate_vec(vec: np.ndarray, roll: float, pitch: float, yaw: float) -> np.ndarray:
+    return rotation_matrix(roll, pitch, yaw) @ vec
 
 
 # rescale a value from one range to another
@@ -51,6 +47,8 @@ def create_save_path() -> pathlib.Path:
 
 
 def save_grid(SAVE_PATH: pathlib.Path, export_grid: np.ndarray, pml_thickness: int, sensor_x: int):
-    np.save(SAVE_PATH / "grid.npy", export_grid[sensor_x:-pml_thickness, pml_thickness:-pml_thickness, pml_thickness:-pml_thickness])
+    stop = -pml_thickness if pml_thickness else None
+    lateral = slice(pml_thickness, stop)
+    np.save(SAVE_PATH / "grid.npy", export_grid[sensor_x:stop, lateral, lateral])
 
 

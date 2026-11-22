@@ -1,14 +1,10 @@
-from typing import Union, List
 from dataclasses import dataclass
-import torch
-import SDF
+
+from SDF import SDFObject
 
 
 @dataclass
 class WorldObject:
-    sdf: Union[SDF.SDFObject]
-    permittivity: torch.tensor
-    conductivity: torch.tensor
-
-
-
+    sdf: SDFObject
+    permittivity: float
+    conductivity: float

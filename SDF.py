@@ -1,12 +1,65 @@
-from abc import abstractmethod, ABC
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-import helpers
+
 import numpy as np
+from scipy.spatial import cKDTree
+
+import helpers
+
+
+def voxel_signed_distance(occupied: np.ndarray) -> np.ndarray:
+    """Exact cell-center distance to the boundary of the occupied unit voxel cubes.
+
+    The world beyond the array is air. A grid with no occupied voxels has distance +inf.
+    A voxel face is a square of side one. The orthogonal projection of an integer
+    cell center onto that square, clamped to its edges, lands at its center, an
+    edge midpoint, or a corner. Searching those nine points on each exposed face
+    therefore gives the exact Euclidean distance, including at edges and corners.
+    """
+    occupied = np.asarray(occupied, dtype=bool)
+    if occupied.ndim != 3 or min(occupied.shape) < 1:
+        raise ValueError("Occupancy must be a nonempty three-dimensional grid")
+    if not occupied.any():
+        return np.full(occupied.shape, np.inf)
+
+    # Coordinates on this doubled lattice put centers at odd indices and
+    # voxel faces at even indices along the face normal. Shared points coalesce.
+    surface = np.zeros(tuple(2 * n + 1 for n in occupied.shape), dtype=bool)
+    for normal in range(3):
+        faces = np.diff(occupied, axis=normal, prepend=False, append=False)
+        tangent1, tangent2 = [axis for axis in range(3) if axis != normal]
+        indices = [slice(None, None, 2)] * 3
+        for i in range(3):
+            indices[tangent1] = slice(i, i + 2 * occupied.shape[tangent1], 2)
+            for j in range(3):
+                indices[tangent2] = slice(j, j + 2 * occupied.shape[tangent2], 2)
+                surface[tuple(indices)] |= faces
+    tree = cKDTree(np.argwhere(surface))
+    del surface
+    plane = np.empty((*occupied.shape[1:], 3), dtype=np.float64)
+    plane[..., 1], plane[..., 2] = 2 * np.indices(occupied.shape[1:]) + 1
+    distance = np.empty(occupied.shape, dtype=np.float64)
+    for x in range(occupied.shape[0]):
+        plane[..., 0] = 2 * x + 1
+        distance[x] = tree.query(plane)[0] * 0.5
+    distance[occupied] *= -1
+    return distance
+
+
+def coordinate_roundoff(bounds: np.ndarray) -> float:
+    """Allow for floating-point coordinate subtraction and rotation, in cells."""
+    scale = max(1.0, np.abs(bounds).max(), np.ptp(bounds, axis=0).max())
+    return 16 * np.finfo(np.float64).eps * scale
+
 
 class SDFObject(ABC):
     @abstractmethod
     def sdf(self, point: np.ndarray) -> float:
         pass
+
+    def distances(self, points: np.ndarray) -> np.ndarray:
+        """Evaluate a grid of points, including shapes with a point-only SDF."""
+        return np.apply_along_axis(self.sdf, -1, points)
 
     @abstractmethod
     def get_bounding_box(self) -> np.ndarray:
@@ -19,56 +72,32 @@ class Sphere(SDFObject):
     radius: float
 
     def sdf(self, point: np.ndarray) -> float:
-        return np.linalg.norm(point - self.position) - self.radius
+        return float(self.distances(point))
+
+    def distances(self, points: np.ndarray) -> np.ndarray:
+        return np.linalg.norm(points - self.position, axis=-1) - self.radius
 
     def get_bounding_box(self) -> np.ndarray:
-        lower_corner = self.position - self.radius
-        upper_corner = self.position + self.radius
-        return np.array([lower_corner, upper_corner])
+        return np.array([self.position - self.radius, self.position + self.radius])
 
 
 @dataclass
 class Box(SDFObject):
-    position: np.ndarray  # [x, y, z]
-    size: np.ndarray  # [x, y, z]
-    rotation: np.ndarray  # [roll, pitch, yaw]
+    position: np.ndarray
+    size: np.ndarray  # full extents along local x, y, z
+    rotation: np.ndarray  # roll, pitch, yaw in degrees
 
     def sdf(self, point: np.ndarray) -> float:
-        local_point = helpers.rotate_vec(point - self.position, *-self.rotation)
+        return float(self.distances(point))
 
-        # Absolute distance from the local_point to the box edges
-        d = np.abs(local_point) - self.size / 2
-
-        # Calculate the outside distance (this will be positive if the point is outside the box, zero if on the surface)
-        outside_distance = np.linalg.norm(np.clip(d, 0.0, None), ord=2)
-
-        # Calculate the inside distance (this will be negative if the point is inside the box, zero if on the surface)
-        inside_distance = np.min(np.maximum(d[0], np.maximum(d[1], d[2])), 0)
-
-        # The SDF is outside_distance + inside_distance (this will be positive outside the box, negative inside)
-        return outside_distance + inside_distance
+    def distances(self, points: np.ndarray) -> np.ndarray:
+        # For row vectors, multiplying on the right by R applies the inverse rotation.
+        local = (points - self.position) @ helpers.rotation_matrix(*self.rotation)
+        q = np.abs(local) - self.size / 2
+        exterior = np.linalg.norm(np.maximum(q, 0), axis=-1)
+        interior = np.minimum(q.max(axis=-1), 0)
+        return exterior + interior
 
     def get_bounding_box(self) -> np.ndarray:
-        # Step 1: Compute the 8 corner points of the rotated box in local coordinates
-        half_size = self.size / 2
-        corners_local = np.array([
-            [-half_size[0], -half_size[1], -half_size[2]],
-            [-half_size[0], -half_size[1],  half_size[2]],
-            [-half_size[0],  half_size[1], -half_size[2]],
-            [-half_size[0],  half_size[1],  half_size[2]],
-            [ half_size[0], -half_size[1], -half_size[2]],
-            [ half_size[0], -half_size[1],  half_size[2]],
-            [ half_size[0],  half_size[1], -half_size[2]],
-            [ half_size[0],  half_size[1],  half_size[2]],
-        ])
-
-        # Step 2: Transform the corner points to world coordinates
-        # For this we need to implement a rotation function, which is not provided here.
-        corners_world = [helpers.rotate_vec(corner, *self.rotation) + self.position for corner in corners_local]
-
-        # Step 3: Find min and max coordinates
-        min_corner = np.min(corners_world, axis=0)
-        max_corner = np.max(corners_world, axis=0)
-
-        # Step 4: Return AABB
-        return np.array([min_corner, max_corner])
+        half_extent = np.abs(helpers.rotation_matrix(*self.rotation)) @ (self.size / 2)
+        return np.array([self.position - half_extent, self.position + half_extent])
