@@ -95,7 +95,12 @@ def generate(root, *, scenes, seed, start_index, material, objects, batch_size, 
     origin = metadata["grid_origin_cells"]
     region = tuple(slice(start, n - config.pml_thickness) for start, n in zip(origin, config.grid_shape))
     source_dir = Path(__file__).resolve().parent
-    manifest = dict(phantom_benchmark_version=VERSION, seed=seed, objects_per_scene=objects, material=material,
+    geometry_sources = ("PhantomBenchmark.py", "Acquisition.py", "Sensor.py", "WorldGenerator.py",
+                        "SDF.py", "inner_functions.py", "helpers.py")
+    geometry_hashes = {name: hashlib.sha256((source_dir / name).read_bytes()).hexdigest()
+                       for name in geometry_sources}
+    manifest = dict(phantom_benchmark_version=VERSION, source_sha256=geometry_hashes, seed=seed,
+                    objects_per_scene=objects, material=material,
                     engine="BatchFDTD", dtype=dtype, acquisition=metadata,
                     solver_sha256=hashlib.sha256(b"".join((source_dir / f).read_bytes()
                                                  for f in ("BatchFDTD.cpp", "BatchFDTD.py"))).hexdigest())
