@@ -1,6 +1,6 @@
 """Fit the one or two inclusions selected by EchoSet to all measured RF voltages.
 
-The input NPZ comes from EchoSet.py predict --instances. Each two-inclusion
+The input NPZ comes from EchoSet.py infer --instances. Each two-inclusion
 trial solves Maxwell's equations with both materials on the same grid.
 """
 
@@ -198,12 +198,18 @@ def _fit_pair(fit, slots, iterations):
         branches.append((error, initial, model, p))
 
     # Keep both spherical and cuboidal alternatives for each learned slot.
-    # First adjust relative positions, then spend the fine-pose budget on
-    # the two best complete predictions.
+    # After translating, the materials estimated at the old positions can
+    # badly misrepresent even an exact geometry. Refit both inclusions at
+    # the proposed positions on all shots before pruning any shape families.
     positioned = []
     for error, initial, model, p in sorted(branches, key=lambda item: item[0]):
         if error > .002:
             p, error = _translations(fit, model, p, coarse)
+            for step in (.22, .10):
+                if error < 5e-4:
+                    break
+                p = _gauss_newton(fit, model, p, full, _material_steps(model, p, step), .001)
+                p, error = _best(fit, model, [p], full)
         positioned.append((error, initial, model, p))
         if error < 5e-4:
             break
@@ -311,7 +317,7 @@ def refine_instances(scene, prediction, *, material="dielectric", device="cuda",
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scene", type=Path)
-    parser.add_argument("prediction", type=Path, help="NPZ written by EchoSet.py predict --instances")
+    parser.add_argument("prediction", type=Path, help="NPZ written by EchoSet.py infer --instances")
     parser.add_argument("output", type=Path)
     parser.add_argument("--material", choices=MATERIALS, default="dielectric")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
