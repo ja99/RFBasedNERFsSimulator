@@ -30,6 +30,8 @@ The ideal pinhole camera sits at the mean receive-element position and looks alo
 
 Each scene produces a float32 `scene_*/depth.npy` with zero for a missed ray. The shared `camera.json` records the intrinsics, metric pose, crop and miss convention. An inference pipeline can load the image and calibration beside the RF recordings. The simulator reads voxel occupancy to render the visible surface. Object identities and RF material coefficients play no role in the image.
 
+For ray-based reconstruction, `camera.observations(depth_m, tolerance_m=0)` returns two Boolean voxel grids for measured free space and first surfaces. A missed ray leaves the RF estimate unconstrained. A positive uncertainty half-width preserves ambiguous voxels at the observed surface. This inverse operation uses only the measured frame and camera calibration.
+
 ## Single-shot metre-scale experiment
 
 ```bash

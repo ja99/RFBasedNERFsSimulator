@@ -30,6 +30,31 @@ class DepthCameraTests(unittest.TestCase):
         np.testing.assert_allclose(camera["position_m"], np.array([7, 8, 15]) * 0.01)
         self.assertAlmostEqual(np.linalg.det(camera["camera_to_world_rotation"]), 1)
 
+    def test_inverse_observations_respect_occlusion_misses_and_units(self):
+        scene = self.empty.copy()
+        scene[3] = True
+        depth = self.camera.render(scene)
+        free, surface = self.camera.observations(depth)
+        self.assertTrue(free.any() and surface.any())
+        self.assertFalse((free & scene).any() or (surface & ~scene).any())
+        self.assertFalse(free[3:].any() or surface[4:].any())
+        scene[6] = True
+        np.testing.assert_array_equal(self.camera.render(scene), depth)
+        blank_free, blank_hit = self.camera.observations(np.zeros_like(depth))
+        self.assertFalse(blank_free.any() or blank_hit.any())
+
+        one = np.zeros_like(depth)
+        one[2, 2] = np.nextafter(depth[2, 2], np.float32(0))
+        free, surface = self.camera.observations(one)
+        self.assertTrue(surface[3, 4, 4] and free[2, 4, 4])
+        self.assertEqual(surface.sum(), 1)
+        free, surface = self.camera.observations(one, tolerance_m=.003)
+        self.assertFalse(surface.any() or free[2, 4, 4])
+        self.assertTrue(free[1, 4, 4])
+        one[2, 2] = .03
+        free, surface = self.camera.observations(one, tolerance_m=.003)
+        self.assertTrue(surface[3, 4, 4] and free[2, 4, 4])
+
     def test_oblique_ray_can_enter_side_of_voxel(self):
         scene = self.empty.copy()
         scene[4, 2, 4] = True

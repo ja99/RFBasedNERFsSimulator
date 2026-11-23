@@ -91,7 +91,43 @@ class DepthCamera:
         depths = np.zeros(shape, dtype=np.float32)
         indices[rows, slots] = np.ravel_multi_index(cells[rows, segments].T, self.shape)
         depths[rows, slots] = enter[rows, segments] * spacing
-        return indices, depths
+        exits = np.zeros_like(depths)
+        exits[rows, slots] = leave[rows, segments] * spacing
+        return indices, depths, exits
+
+    def observations(self, depth, tolerance_m=0.0):
+        """Return two disjoint voxel masks of observed free space and first surfaces.
+
+        A zero pixel provides no constraint. A positive metric depth within the
+        crop occupies the cell containing the measured point, selecting the
+        downstream cell at an entry face. Positive depths beyond the crop mark
+        crossed cells free. A first-surface observation wins conflicting votes.
+        A positive tolerance carves only up to the lower depth bound and pins
+        a cell only if the whole return interval lies in that one cell.
+        """
+        if not np.isfinite(tolerance_m) or tolerance_m < 0:
+            raise ValueError("Depth tolerance must be finite and nonnegative")
+        frame = np.asarray(depth)
+        if (frame.shape != self.image_shape or frame.dtype.kind not in "fiu"
+                or not np.isfinite(frame).all() or np.any(frame < 0)):
+            raise ValueError("Expected a finite nonnegative metric depth frame matching the camera")
+        free = np.zeros(self.shape, dtype=bool)
+        occupied = np.zeros_like(free)
+        flat = frame.ravel().astype(np.float64)
+        start = 0
+        for indices, enter, leave in self._paths:
+            measured = flat[start:start + len(indices), None]
+            start += len(indices)
+            # Depth frames and cached metric face coordinates use float32. Allow
+            # one representable depth step at a face when converting metric units.
+            tol = np.spacing(measured.astype(np.float32)).astype(np.float64)
+            lower = measured - tolerance_m + tol
+            upper = measured + tolerance_m + tol
+            crossed = (indices >= 0) & (measured > 0) & (enter <= lower)
+            free.ravel()[indices[crossed & (leave <= lower)]] = True
+            occupied.ravel()[indices[crossed & (leave > upper)]] = True
+        free[occupied] = False
+        return free, occupied
 
     def render(self, occupied):
         """Return first-surface axial depth in metres; zero denotes an empty pixel."""
@@ -101,7 +137,7 @@ class DepthCamera:
         # Index -1 is the empty sentinel in the packed ray paths.
         scene = np.append(occupied.ravel(), False)
         output = []
-        for indices, depths in self._paths:
+        for indices, depths, _ in self._paths:
             solid = scene[indices]
             row = np.arange(len(indices))
             col = solid.argmax(axis=1)
