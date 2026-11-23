@@ -10,6 +10,7 @@ from time import monotonic
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from BenchmarkProvenance import same_acquisition_manifest
 from Acquisition import AcquisitionConfig
 from BatchFDTD import batch_metadata, record_batch
 from SDF import Box, Sphere, coordinate_roundoff
@@ -62,9 +63,11 @@ def generate(root, scenes, seed, start, sealed, batch_size, dtype):
                     sources={k:sha256((Path(__file__).parent/k).read_bytes()).hexdigest()
                              for k in ("MeterBenchmark.py","BatchFDTD.py","BatchFDTD.cpp","SDF.py","Sensor.py","Acquisition.py","helpers.py")})
     config_file = root/"benchmark.json"
-    if config_file.exists() and json.loads(config_file.read_text()) != manifest:
-        raise ValueError(f"Different generator, acquisition or requested cohort already at {root}")
-    config_file.write_text(json.dumps(manifest,indent=2)+"\n")
+    if config_file.exists():
+        if not same_acquisition_manifest(json.loads(config_file.read_text()), manifest, "sources"):
+            raise ValueError(f"Different generator, acquisition or requested cohort already at {root}")
+    else:
+        config_file.write_text(json.dumps(manifest,indent=2)+"\n")
     air = np.ones((1,*CONFIG.grid_shape), dtype=dtype)
     empty = record_batch(CONFIG,air,np.zeros_like(air),dtype=dtype,angles=ANGLES)[0]
     data = []

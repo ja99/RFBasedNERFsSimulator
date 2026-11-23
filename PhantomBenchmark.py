@@ -11,6 +11,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from Acquisition import AcquisitionConfig
+from BenchmarkProvenance import same_acquisition_manifest
 from BatchFDTD import batch_metadata, record_batch
 from SDF import Box, Sphere, voxel_signed_distance
 from WorldObjectType import WorldObject
@@ -106,7 +107,7 @@ def generate(root, *, scenes, seed, start_index, material, objects, batch_size, 
                                                  for f in ("BatchFDTD.cpp", "BatchFDTD.py"))).hexdigest())
     manifest_file = root / "benchmark.json"
     if manifest_file.exists():
-        if json.loads(manifest_file.read_text()) != manifest:
+        if not same_acquisition_manifest(json.loads(manifest_file.read_text()), manifest, "source_sha256"):
             raise ValueError(f"Refusing to mix a new generator or solver with existing data in {root}")
     else:
         if any(root.glob("scene_*")):
@@ -163,4 +164,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
-    generate(**vars(parser.parse_args()))
+    parser.add_argument("--depth-output", type=Path, help="Also write pinhole depth frames for the requested scenes")
+    args = vars(parser.parse_args())
+    depth_output = args.pop("depth_output")
+    generate(**args)
+    if depth_output is not None:
+        from DepthCamera import generate_frames
+        paths = [args["root"] / f"scene_{i:06d}" for i in range(args["start_index"], args["start_index"] + args["scenes"])]
+        generate_frames(paths, depth_output)

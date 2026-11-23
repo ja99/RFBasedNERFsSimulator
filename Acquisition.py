@@ -260,6 +260,7 @@ def main():
     parser.add_argument("--standoff-cells", type=int, help="Override the 0.15-wavelength sensor-to-PML distance")
     parser.add_argument("--samples", type=int, default=AcquisitionConfig.samples_per_shot)
     parser.add_argument("--sample-stride", type=int, help="Solver steps per sample, e.g. for longer recordings")
+    parser.add_argument("--depth-output", type=Path, help="Also write pinhole depth frames for these scenes")
     args = parser.parse_args()
     if args.scenes < 1 or args.objects < 1 or args.start_index < 0:
         parser.error("scenes and objects must be positive and start-index must be nonnegative")
@@ -277,6 +278,9 @@ def main():
         np.random.seed(args.seed + i)
         reference = _write_scene(path, config, None, args.objects, args.jobs, reference)
         print(path, flush=True)
+    if args.depth_output is not None:
+        from DepthCamera import generate_frames
+        generate_frames(paths, args.depth_output)
 
 
 if __name__ == "__main__":

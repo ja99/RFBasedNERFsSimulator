@@ -17,6 +17,19 @@ python ../RFBasedNERFsModels/SaveAsHDF5.py "$RF_RUN/test" --normalization-from "
 
 Choose `--material thesis` for the highly conductive, finer-cell acquisition or `--objects 2` for separated inclusions. Generate and normalize a separate training archive for each acquisition geometry. The generator saves scene truth separately from measurement metadata and restores completed scenes when the generation manifest matches. Standard raw waveforms remain usable with `Acquisition.py` and the models' converter.
 
+## Pair RF scenes with a depth camera
+
+For a new batch, pass `--depth-output "$RF_RUN/train-depth"` to either `PhantomBenchmark.py` or `Acquisition.py`. This writes a registered frame for each requested scene. For existing compact data, render the same frames on CPU with the standalone command.
+
+```bash
+python DepthCamera.py --scenes "$RF_RUN/train" --output "$RF_RUN/train-depth"
+python DepthCamera.py --scenes "$RF_RUN/test" --output "$RF_RUN/test-depth"
+```
+
+The ideal pinhole camera sits at the mean receive-element position and looks along the positive world X axis. Each pixel returns the optical-axis distance in metres to the first occupied voxel face. All objects are optically opaque in this model. Pixel columns run toward negative world Y, and rows run toward negative world Z. The default image has 48 × 48 pixels, a 90° horizontal field of view and square pixels. Use `--width`, `--height` and `--hfov-deg` to set the optics.
+
+Each scene produces a float32 `scene_*/depth.npy` with zero for a missed ray. The shared `camera.json` records the intrinsics, metric pose, crop and miss convention. An inference pipeline can load the image and calibration beside the RF recordings. The simulator reads voxel occupancy to render the visible surface. Object identities and RF material coefficients play no role in the image.
+
 ## Single-shot metre-scale experiment
 
 ```bash
