@@ -95,6 +95,23 @@ class DepthCamera:
         exits[rows, slots] = leave[rows, segments] * spacing
         return indices, depths, exits
 
+    def foreground_depth(self, depth_m, background_m, tolerance_m=0.0):
+        """Keep new, closer first returns from a registered static-background pair.
+
+        Zero denotes a miss in either frame. A current hit against a background
+        miss is always retained. When both rays hit, the current surface must
+        be closer by more than tolerance_m. Returned depths stay in metres.
+        """
+        if not np.isscalar(tolerance_m) or not np.isfinite(tolerance_m) or tolerance_m < 0:
+            raise ValueError("Depth tolerance must be finite and nonnegative")
+        depth, background = np.asarray(depth_m), np.asarray(background_m)
+        for frame in (depth, background):
+            if (frame.shape != self.image_shape or frame.dtype.kind not in "fiu"
+                    or not np.isfinite(frame).all() or (frame < 0).any()):
+                raise ValueError("Expected finite nonnegative depths matching the registered camera")
+        closer = background.astype(np.float64) - depth.astype(np.float64) > tolerance_m
+        return np.where((depth > 0) & ((background == 0) | closer), depth, 0)
+
     def observations(self, depth, tolerance_m=0.0):
         """Return two disjoint voxel masks of observed free space and first surfaces.
 

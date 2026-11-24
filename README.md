@@ -32,6 +32,8 @@ Each scene produces a float32 `scene_*/depth.npy` with zero for a missed ray. Th
 
 For ray-based reconstruction, `camera.observations(depth_m, tolerance_m=0)` returns two Boolean voxel grids for measured free space and first surfaces. A missed ray leaves the RF estimate unconstrained. A positive uncertainty half-width preserves ambiguous voxels at the observed surface. This inverse operation uses only the measured frame and camera calibration.
 
+For a static scene, `camera.foreground_depth(measured_m, empty_room_m, tolerance_m=0)` keeps the measured depth of a new first surface. Capture both frames with the same camera pose and intrinsics. A positive tolerance in metres sets the minimum separation when both frames see a surface. Misses and unchanged background return zero.
+
 ## Single-shot metre-scale experiment
 
 ```bash

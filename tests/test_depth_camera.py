@@ -55,6 +55,27 @@ class DepthCameraTests(unittest.TestCase):
         free, surface = self.camera.observations(one, tolerance_m=.003)
         self.assertTrue(surface[3, 4, 4] and free[2, 4, 4])
 
+    def test_registered_background_retains_only_new_closer_surfaces(self):
+        measured = np.zeros((5, 5), np.float32)
+        reference = np.zeros_like(measured)
+        measured[0] = [.25, .25, .25, .25, 0]
+        reference[0] = [0, .5, .25, .125, .5]
+        original = measured.copy(), reference.copy()
+        retained = self.camera.foreground_depth(measured, reference)
+        np.testing.assert_array_equal(retained[0], [.25, .25, 0, 0, 0])
+        self.assertEqual(retained.dtype, np.float32)
+        np.testing.assert_array_equal(self.camera.foreground_depth(measured, reference, .25)[0],
+                                      [.25, 0, 0, 0, 0])
+        np.testing.assert_array_equal(measured, original[0])
+        np.testing.assert_array_equal(reference, original[1])
+        for bad in (measured[:, 0], -reference, np.full_like(reference, np.nan)):
+            for images in ((measured, bad), (bad, measured)):
+                with self.assertRaises(ValueError):
+                    self.camera.foreground_depth(*images)
+        for tol in (-.1, np.inf):
+            with self.assertRaises(ValueError):
+                self.camera.foreground_depth(measured, reference, tolerance_m=tol)
+
     def test_oblique_ray_can_enter_side_of_voxel(self):
         scene = self.empty.copy()
         scene[4, 2, 4] = True
