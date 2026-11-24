@@ -17,6 +17,40 @@ python ../RFBasedNERFsModels/SaveAsHDF5.py "$RF_RUN/test" --normalization-from "
 
 Choose `--material thesis` for the highly conductive, finer-cell acquisition or `--objects 2` for separated inclusions. Generate and normalize a separate training archive for each acquisition geometry. The generator saves scene truth separately from measurement metadata and restores completed scenes when the generation manifest matches. Standard raw waveforms remain usable with `Acquisition.py` and the models' converter.
 
+## Simulate larger grids
+
+The batched FDTD solver stores the absorbing boundary's history only on the six faces where it is used. With a cubic grid of side `N` and PML thickness `p`, this takes `24 p N²` scalar values per simultaneous shot. The previous implementation allocated `12 N³` history values. Both allocate another `6 N³` values for the electric and magnetic fields. FP32 uses four bytes per value. Material coefficients are shared across a scene's beams.
+
+For the compact phantom generator, `--batch-size 1 --max-parallel-beams 1` runs one scene and one beam at a time. The output still includes all five beams on the common sampling clock in their original order. In Python, pass `max_parallel_beams=1` to `BatchFDTD.record_batch` with your own `AcquisitionConfig` and material arrays. Increasing the limit allows more beams to run concurrently when memory permits. Use a fresh output directory for a new generator revision because the dataset manifest records the solver source hash.
+
+For a configurable grid, choose `batch.cuda` or `batch.cpu` with `Acquisition.py`. For example, this command records one random scene at the default material-resolved spacing, together with its matched vacuum recording. The batched generator uses FP32 by default and accepts `--dtype float64` for precision studies.
+
+```bash
+python Acquisition.py ./rf-larger --backend batch.cuda --shape 128 216 216 --scenes 1 --max-parallel-beams 1
+```
+
+The benchmark below uses FP32, a four-cell PML, 16 receivers and 128 voltage samples. One scene contains a lossy dielectric box and the other is the matched vacuum reference. Both receive all five shots. CPU times on the Ryzen 7 5800H use four pinned OpenMP threads. CPU memory is peak process RSS. GPU memory is peak allocated PyTorch device memory on the RTX 3050 Laptop GPU. GPU allocator reserves and the CUDA context need additional device memory.
+
+| Device and grid | Previous peak | Optimized peak | Previous recording time | Optimized recording time |
+| --- | ---: | ---: | ---: | ---: |
+| CPU, 64³, 382 steps | 527 MiB | 385 MiB | 10.43 s | 6.26 s |
+| CPU, 80³, 509 steps | 734 MiB | 424 MiB | 19.20 s | 13.58 s |
+| GPU, 64³, 382 steps | 185 MiB | 79 MiB | 0.64–0.67 s | 0.64–0.67 s |
+| GPU, 184³, 890 steps | 4,277 MiB minimum¹ | 1,646 MiB | — | 34.22 s |
+| GPU, 184³, one beam at a time | — | 407 MiB | — | 34.95 s |
+
+¹ Calculated for the old fields and boundary history alone. This exceeds the installed GPU's memory. The 64³ CPU times are medians of three recordings, the 64³ GPU times are two warm recordings per revision, and each larger-grid configuration was timed once. The two 184³ runs gave bitwise-identical voltages. On each grid where both revisions ran, the saved FP32 voltages matched bit for bit on the same device. At 80³ on CPU, limiting execution to one beam per scene reduced peak process memory to 354 MiB and took 14.79 s.
+
+With the default 128 × 216 × 216 grid (1.179 mm cells and a 15-cell PML), the same GPU recorded vacuum and a 14-cell-wide conductive cube (relative permittivity 54.16, conductivity 11.29 S/m). All five beams and 750 samples took 66.3 s and 460 MiB of peak GPU tensor memory with one beam per scene at a time. The box produced a finite echo on every beam, with peak amplitude ranging from 0.963 to 1.496 mV after vacuum subtraction. On the broadside beam, the FP32 echo differed from an FP64 run at the same 750 sample times by 0.0117% in relative L2 norm. The largest voltage error was 0.357 µV on an echo with a 1.148 mV peak. This timing covers waveform acquisition from material arrays. Scene voxelization and disk writing add time in the generator.
+
+To reproduce a measurement from the simulator root, run once to compile the kernel and then repeat in a fresh process. Increasing the side at fixed spacing also increases the required round-trip recording window and the number of solver steps.
+
+```bash
+PYTHONPATH=. OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 python benchmarks/batch_memory.py --side 64 --repeat 3
+PYTHONPATH=. python benchmarks/batch_memory.py --side 184 --device cuda --max-parallel-beams 1
+PYTHONPATH=. python benchmarks/batch_memory.py --default-acquisition --device cuda --max-parallel-beams 1
+```
+
 ## Pair RF scenes with a depth camera
 
 For a new batch, pass `--depth-output "$RF_RUN/train-depth"` to either `PhantomBenchmark.py` or `Acquisition.py`. This writes a registered frame for each requested scene. For existing compact data, render the same frames on CPU with the standalone command.
