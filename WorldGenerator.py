@@ -103,7 +103,7 @@ def generate_objects(grid: fdtd.Grid, n_obj: int, pml_thickness: int,
     size_scale = 1.0 if size_unit_m is None else size_unit_m / grid.grid_spacing
     sensor_bounds = sensor.get_bounding_box()
     lower = np.array([max(pml_thickness, int(sensor.position[0])), pml_thickness, pml_thickness])
-    upper = np.array(grid.E.shape[:3]) - pml_thickness - 1
+    upper = np.array(grid.shape) - pml_thickness - 1
     objects = []
     for _ in range(n_obj):
         permittivity = 54.16 + get_random_scalar((-30, 30))
@@ -135,14 +135,15 @@ def fill_world(grid: fdtd.Grid, n_obj: int, pml_thickness: int, sensor: SensorDe
     return add_objects_to_grid(objects, grid, pml_thickness)
 
 
-def voxelize_world(objects: List[WorldObject], grid: fdtd.Grid, pml_thickness: int, n_jobs: int = 20):
+def voxelize_world(objects: List[WorldObject], grid: fdtd.Grid, pml_thickness: int, n_jobs: int = 20,
+                   *, material_dtype=None):
     """Return the full label array and reusable z-runs for the physical interior.
 
     The most negative primitive SDF assigns the material in overlapping shapes.
     The exported SDF measures the boundary of the resulting occupied voxel union
     in grid cells. Occupied centers are negative. Empty reference scenes use +inf.
     """
-    shape = grid.E.shape[:3]
+    shape = grid.shape
     if pml_thickness < 0 or min(shape) <= 2 * pml_thickness:
         raise ValueError("PML thickness must leave a nonempty interior on each axis")
     if n_jobs < 1:
@@ -164,7 +165,8 @@ def voxelize_world(objects: List[WorldObject], grid: fdtd.Grid, pml_thickness: i
     np.divide(1.0, inverse_background, out=export_grid[interior + (0,)])
     # fdtd casts background material parameters to the requested backend
     # precision even when its allocated field or coefficient arrays are float64.
-    material_dtype = fdtd.backend.numpy(fdtd.backend.array(0.0, dtype=fdtd.backend.float)).dtype
+    if material_dtype is None:
+        material_dtype = fdtd.backend.numpy(fdtd.backend.array(0.0, dtype=fdtd.backend.float)).dtype
 
     def sample_plane(x):
         return voxelize_slab(objects, (x, x + 1), y_range, z_range, export_grid[x, ys, zs, 0],

@@ -199,9 +199,9 @@ def record_shots(config, material_runs=(), angles=BEAMS):
     return recordings
 
 
-def _layout(config, objects, n_objects, n_jobs):
+def _layout(config, objects, n_objects, n_jobs, *, geometry=None, material_dtype=None):
     gc.collect()
-    grid, sensor = _grid_and_sensor(config)
+    grid, sensor = geometry if geometry is not None else _grid_and_sensor(config)
     if objects is None:
         objects = generate_objects(grid, n_objects, config.pml_thickness, sensor, size_unit_m=config.object_unit_m)
     if not objects:
@@ -212,19 +212,54 @@ def _layout(config, objects, n_objects, n_jobs):
         box = obj.sdf.get_bounding_box()
         if np.any(box[0] < lower) or np.any(box[1] > upper) or bounding_box_overlap(box, sensor.get_bounding_box()):
             raise ValueError("Scene objects must fit in the saved volume and clear the sensor")
-    labels, runs = voxelize_world(objects, grid, config.pml_thickness, n_jobs)
+    labels, runs = voxelize_world(objects, grid, config.pml_thickness, n_jobs, material_dtype=material_dtype)
     if not runs:
         raise ValueError("Scene contains no occupied cells at this grid spacing")
     return labels, runs
 
 
-def _write_scene(destination, config, objects, n_objects, n_jobs, reference=None):
+def _batch_scene(config, objects, n_objects, n_jobs, reference, device, dtype, max_parallel_beams):
+    from BatchFDTD import _grid_and_sensor as batch_geometry, batch_metadata, record_batch
+
+    if dtype not in ("float32", "float64"):
+        raise ValueError("Batch field dtype must be float32 or float64")
+    geometry = batch_geometry(config)
+    labels, runs = _layout(config, objects, n_objects, n_jobs, geometry=geometry, material_dtype=dtype)
+    # The native solver reads dense coefficients directly from the voxel labels.
+    del runs
+    metadata = batch_metadata(config)
+    source_dir = Path(__file__).resolve().parent
+    metadata.update(engine="BatchFDTD", dtype=dtype, solver_sha256=sha256(b"".join(
+        (source_dir / name).read_bytes() for name in ("BatchFDTD.cpp", "BatchFDTD.py")
+    )).hexdigest())
+    options = dict(device=device, dtype=dtype, max_parallel_beams=max_parallel_beams)
+    eps = np.ones((1, *config.grid_shape), dtype=dtype)
+    sigma = np.zeros_like(eps)
+    if reference is None:
+        reference = record_batch(config, eps, sigma, **options)[0], metadata
+    pml = config.pml_thickness
+    interior = (slice(pml, -pml or None),) * 3
+    eps[(0, *interior)] = labels[interior + (0,)]
+    sigma[(0, *interior)] = labels[interior + (1,)]
+    sensor_samples = record_batch(config, eps, sigma, **options)[0]
+    return labels, sensor_samples, metadata, reference
+
+
+def _write_scene(destination, config, objects, n_objects, n_jobs, reference=None, *,
+                 batch_device=None, dtype=None, max_parallel_beams=None):
     if destination.exists():
         raise FileExistsError(destination)
-    labels, runs = _layout(config, objects, n_objects, n_jobs)
-    if reference is None:
-        reference = _record_shots(config, (), BEAMS)
-    sensor_samples, metadata = _record_shots(config, runs, BEAMS)
+    if batch_device is None:
+        if dtype is not None or max_parallel_beams is not None:
+            raise ValueError("dtype and max_parallel_beams require a batch backend")
+        labels, runs = _layout(config, objects, n_objects, n_jobs)
+        if reference is None:
+            reference = _record_shots(config, (), BEAMS)
+        sensor_samples, metadata = _record_shots(config, runs, BEAMS)
+    else:
+        labels, sensor_samples, metadata, reference = _batch_scene(
+            config, objects, n_objects, n_jobs, reference, batch_device,
+            "float32" if dtype is None else dtype, max_parallel_beams)
     empty_samples, empty_metadata = reference
     if empty_metadata != metadata:
         raise ValueError("Scene and empty-reference acquisition settings differ")
@@ -241,9 +276,11 @@ def _write_scene(destination, config, objects, n_objects, n_jobs, reference=None
     return reference
 
 
-def write_scene(destination, config, objects=None, *, n_objects=1, n_jobs=20):
+def write_scene(destination, config, objects=None, *, n_objects=1, n_jobs=20,
+                batch_device=None, dtype=None, max_parallel_beams=None):
     """Simulate one scene and its matched empty reference in a new directory."""
-    _, metadata = _write_scene(Path(destination), config, objects, n_objects, n_jobs)
+    _, metadata = _write_scene(Path(destination), config, objects, n_objects, n_jobs,
+                               batch_device=batch_device, dtype=dtype, max_parallel_beams=max_parallel_beams)
     return metadata
 
 
@@ -255,7 +292,11 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--objects", type=int, default=1)
     parser.add_argument("--jobs", type=int, default=20, help="CPU workers for voxelization")
-    parser.add_argument("--backend", choices=("numpy", "torch", "torch.cuda"), default="torch")
+    parser.add_argument("--backend", choices=("numpy", "torch", "torch.cuda", "batch.cpu", "batch.cuda"),
+                        default="torch")
+    parser.add_argument("--dtype", choices=("float32", "float64"), help="Batch solver precision (default: float32)")
+    parser.add_argument("--max-parallel-beams", type=int,
+                        help="Number of simultaneous beams in the batch solver (default: all five)")
     parser.add_argument("--shape", type=int, nargs=3, default=AcquisitionConfig.grid_shape, metavar=("X", "Y", "Z"))
     parser.add_argument("--pml", type=int, default=AcquisitionConfig.pml_thickness)
     parser.add_argument("--grid-spacing-m", type=float, help="Override the material-resolved cell size in metres")
@@ -269,6 +310,11 @@ def main():
     args = parser.parse_args()
     if args.scenes < 1 or args.objects < 1 or args.start_index < 0:
         parser.error("scenes and objects must be positive and start-index must be nonnegative")
+    batch_device = args.backend.removeprefix("batch.") if args.backend.startswith("batch.") else None
+    if batch_device is None and (args.dtype is not None or args.max_parallel_beams is not None):
+        parser.error("--dtype and --max-parallel-beams require --backend batch.cpu or batch.cuda")
+    if args.max_parallel_beams is not None and args.max_parallel_beams < 1:
+        parser.error("--max-parallel-beams must be positive")
     config = AcquisitionConfig(grid_shape=tuple(args.shape), pml_thickness=args.pml, grid_spacing_m=args.grid_spacing_m,
                                pitch_cells=args.pitch_cells, samples_per_shot=args.samples,
                                standoff_cells=args.standoff_cells, sample_stride=args.sample_stride,
@@ -277,11 +323,12 @@ def main():
     for path in paths:
         if path.exists():
             raise FileExistsError(path)
-    fdtd.set_backend(args.backend)
+    fdtd.set_backend("numpy" if batch_device is not None else args.backend)
     reference = None
     for i, path in enumerate(paths, start=args.start_index):
         np.random.seed(args.seed + i)
-        reference = _write_scene(path, config, None, args.objects, args.jobs, reference)
+        reference = _write_scene(path, config, None, args.objects, args.jobs, reference, batch_device=batch_device,
+                                 dtype=args.dtype, max_parallel_beams=args.max_parallel_beams)
         print(path, flush=True)
     if args.depth_output is not None:
         from DepthCamera import generate_frames

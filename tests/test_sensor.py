@@ -3,6 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from fdtd.constants import c
 from fdtd.conversions import worldE_to_simE
@@ -133,6 +134,45 @@ class AcquisitionTests(unittest.TestCase):
                 k = 2 * np.pi * f / c * np.sqrt(er - 1j * sigma / (2 * np.pi * f * eps0))
                 self.assertGreaterEqual(2 * np.pi / k.real / dx, 10. - 1e-10)
                 self.assertGreaterEqual(1 / abs(k.imag) / dx, 2.)
+
+    def test_batch_generator_matches_reference_files_and_reuses_empty_shot_set(self):
+        from Acquisition import main
+        from BatchFDTD import record_batch
+
+        options = ["--shape", "20", "19", "23", "--pml", "2", "--grid-spacing-m", ".00625",
+                   "--object-unit-m", ".0015", "--standoff-cells", "2", "--pitch-cells", "2",
+                   "--samples", "96", "--jobs", "1", "--seed", "7"]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("sys.argv", ["Acquisition.py", str(root / "reference"), "--backend", "numpy", *options]):
+                main()
+            with (patch("sys.argv", ["Acquisition.py", str(root / "native"), "--backend", "batch.cpu",
+                                     "--max-parallel-beams", "1", "--scenes", "2", *options]),
+                  patch("Acquisition.grid_init", side_effect=AssertionError("full reference grid allocated")),
+                  patch("BatchFDTD.record_batch", wraps=record_batch) as recorder):
+                main()
+                self.assertEqual(recorder.call_count, 3)
+            reference = root / "reference" / "scene_000000"
+            native = root / "native" / "scene_000000"
+            second = native.with_name("scene_000001")
+            metadata = json.loads((native / "acquisition.json").read_text())
+            self.assertEqual(metadata.pop("engine"), "BatchFDTD")
+            self.assertEqual(metadata.pop("dtype"), "float32")
+            self.assertRegex(metadata.pop("solver_sha256"), r"^[a-f0-9]{64}$")
+            self.assertEqual(metadata, json.loads((reference / "acquisition.json").read_text()))
+            labels = np.load(native / "grid.npy")
+            expected = np.load(reference / "grid.npy")
+            np.testing.assert_array_equal(labels[..., 2], expected[..., 2])
+            np.testing.assert_allclose(labels[..., :2], expected[..., :2], rtol=1e-7)
+            empty = np.load(native / "empty_sensor_samples.npy")
+            np.testing.assert_array_equal(empty, np.load(second / "empty_sensor_samples.npy"))
+            raw = np.load(native / "sensor_samples.npy")
+            self.assertEqual(raw.dtype, np.float32)
+            expected_raw = np.load(reference / "sensor_samples.npy")
+            expected_empty = np.load(reference / "empty_sensor_samples.npy")
+            for actual, truth in ((raw, expected_raw), (empty, expected_empty),
+                                  (raw - empty, expected_raw - expected_empty)):
+                self.assertLess(np.linalg.norm(actual - truth) / np.linalg.norm(truth), 3e-4)
 
     def test_standoff_and_recording_window_follow_the_mesh(self):
         nominal = AcquisitionConfig()

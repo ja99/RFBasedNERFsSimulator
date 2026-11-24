@@ -262,7 +262,7 @@ class GeometryTests(unittest.TestCase):
                 objects = []
                 for cells, spacing, size_unit in [(120, unit, None), (240, unit / 2, unit),
                                                    (240, unit / 2, None)]:
-                    grid = SimpleNamespace(grid_spacing=spacing, E=SimpleNamespace(shape=(cells, cells, cells, 3)))
+                    grid = SimpleNamespace(grid_spacing=spacing, shape=(cells, cells, cells))
                     np.random.seed(seed)
                     objects.extend(generate_objects(grid, 1, 3, sensor, size_unit_m=size_unit))
                 coarse, refined, default_refined = objects
