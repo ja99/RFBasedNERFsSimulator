@@ -101,6 +101,12 @@ class AcquisitionConfig:
 
 def _grid_and_sensor(config):
     grid = grid_init(config.grid_shape, config.spacing, 1., 1., config.pml_thickness)
+    sensor = _make_sensor(config, grid)
+    grid[0, 0, 0] = sensor
+    return grid, sensor
+
+
+def _make_sensor(config, grid):
     wavelength = c / config.frequency_hz
     pitch = config.pitch_cells if config.pitch_cells is not None else wavelength / (2 * config.spacing)
     position, rotation = PhasedSensorDevice.get_position_and_rotation(grid, config.pml_thickness, config.standoff)
@@ -111,8 +117,7 @@ def _grid_and_sensor(config):
     lo, hi = sensor.get_bounding_box()
     if np.any(lo < config.pml_thickness) or np.any(hi >= np.array(grid.shape) - config.pml_thickness):
         raise ValueError("Choose grid_shape, pitch_cells and standoff_cells to fit the aperture in the interior")
-    grid[0, 0, 0] = sensor
-    return grid, sensor
+    return sensor
 
 
 def _sampling_stride(config, grid, sensor, angles):

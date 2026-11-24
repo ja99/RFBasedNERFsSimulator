@@ -19,13 +19,14 @@ from pathlib import Path
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import fdtd
 from fdtd.constants import eta0
 import numpy as np
 import torch
 
-from Acquisition import ACQUISITION_VERSION, BEAMS, FDTD_SOURCE_SHA256, _grid_and_sensor, _sampling_stride
+from Acquisition import ACQUISITION_VERSION, BEAMS, FDTD_SOURCE_SHA256, _make_sensor, _sampling_stride
 from WorldGenerator import SDF_TARGET
 
 
@@ -34,8 +35,9 @@ BATCH_FDTD_SOURCE_SHA256 = hashlib.sha256(Path(__file__).with_suffix(".cpp").rea
 
 class _Layout(ctypes.Structure):
     _fields_ = [(key, ctypes.c_int) for key in (
-        "nx", "ny", "nz", "scenes", "beams", "antennas", "path_length", "samples", "stride"
-    )] + [("courant", ctypes.c_double), ("direction", ctypes.c_double * 3)]
+        "nx", "ny", "nz", "scenes", "beams", "antennas", "path_length", "samples", "stride",
+        "pml", "emitter_x0", "emitter_x1"
+    )] + [("slab_offsets", ctypes.c_size_t * 4), ("courant", ctypes.c_double), ("direction", ctypes.c_double * 3)]
 
 
 class _Buffers(ctypes.Structure):
@@ -98,8 +100,39 @@ class _Plan:
     profiles: np.ndarray
     source: np.ndarray
     weights: np.ndarray
+    emitter_x0: int
     emitters: np.ndarray
     paths: np.ndarray
+
+
+def _grid_and_sensor(config):
+    # Time step and Courant number depend on dimensionality and spacing, not extent.
+    probe = fdtd.Grid(tuple(min(int(n), 2) for n in config.grid_shape), grid_spacing=config.spacing)
+    geometry = SimpleNamespace(shape=config.grid_shape, grid_spacing=probe.grid_spacing,
+                               time_step=probe.time_step, courant_number=probe.courant_number)
+    return geometry, _make_sensor(config, geometry)
+
+
+def _pml_profiles(shape, pml, spacing, courant):
+    profiles = np.zeros((2, 3, 2, max(shape)), dtype=np.float64)
+    if pml == 0:
+        return profiles
+    # The pinned isotropic PML depends only on distance normal to a face. Obtain
+    # its two 1D sequences without allocating a full reference solver or slabs.
+    strip = fdtd.Grid((2 * pml + 1, 2, 2), grid_spacing=spacing, courant_number=courant)
+    for high in (False, True):
+        boundary = fdtd.PML(a=1e-8)  # same stability factor as WorldGenerator.grid_init
+        strip[slice(-pml, None) if high else slice(pml), :, :] = boundary
+        for phase, name in enumerate(("E", "H")):
+            for index, coefficient in enumerate(("b", "c")):
+                values = fdtd.backend.numpy(getattr(boundary, coefficient + name)[:, 0, 0, 0])
+                for axis, extent in enumerate(shape):
+                    start = extent - pml if high else 0
+                    profiles[phase, axis, index, start:start + pml] = values
+                    if index == 1:
+                        # The reference convolution takes differences within each slab.
+                        profiles[phase, axis, index, start if phase == 0 else start + pml - 1] = 0
+    return profiles
 
 
 @lru_cache(maxsize=8)
@@ -107,23 +140,8 @@ def _make_plan(config, angles):
     grid, sensor = _grid_and_sensor(config)
     stride = _sampling_stride(config, grid, sensor, angles)
     shape = tuple(grid.shape)
-    profiles = np.zeros((2, 3, 2, max(shape)), dtype=np.float64)
     pml = config.pml_thickness
-    if pml:
-        for axis, letter in enumerate("xyz"):
-            for side in ("low", "high"):
-                boundary = getattr(grid, f"_{letter}{side}_boundary")
-                select = [0, 0, 0, axis]
-                select[axis] = slice(None)
-                lo = 0 if side == "low" else shape[axis] - pml
-                for phase, name in enumerate(("E", "H")):
-                    for index, coefficient in enumerate(("b", "c")):
-                        values = getattr(boundary, coefficient + name)[tuple(select)]
-                        profiles[phase, axis, index, lo:lo + pml] = fdtd.backend.numpy(values)
-                    # fdtd's convolution uses differences strictly within each
-                    # slab, including the first cell of its upper-side E layer.
-                    skip = lo if phase == 0 else lo + pml - 1
-                    profiles[phase, axis, 1, skip] = 0
+    profiles = _pml_profiles(shape, pml, grid.grid_spacing, grid.courant_number)
     steps = 1 + (config.samples_per_shot - 1) * stride
     times = np.arange(steps, dtype=np.float64) * grid.time_step
     source = np.empty((steps, len(angles), len(sensor.antennas)), dtype=np.float64)
@@ -134,8 +152,10 @@ def _make_plan(config, angles):
             pulse = antenna.amplitude * np.sin(2 * np.pi * t / antenna.width_pulse)
             active = antenna.transmitter & (t >= 0) & (t < sensor.n_pulses * antenna.width_pulse)
             source[:, beam, i] = np.where(active, pulse, 0.0)
-    emitters = np.full(shape, -1, dtype=np.int32)
-    emitters[tuple(sensor.transmit_positions_cells.T)] = np.arange(len(sensor.antennas))
+    tx, ty, tz = sensor.transmit_positions_cells.T
+    emitter_x0, emitter_x1 = int(tx.min()), int(tx.max()) + 1
+    emitters = np.full((emitter_x1 - emitter_x0, *shape[1:]), -1, dtype=np.int32)
+    emitters[tx - emitter_x0, ty, tz] = np.arange(len(sensor.antennas))
     paths = np.ravel_multi_index(sensor._path_indices, shape).astype(np.int32)
     metadata = {
         "acquisition_version": ACQUISITION_VERSION, "fdtd_version": fdtd.__version__,
@@ -152,7 +172,7 @@ def _make_plan(config, angles):
         "source_amplitude_sim": float(config.source_amplitude_sim), "voltage_units": "V",
     }
     plan = _Plan(metadata, grid.courant_number, sensor._direction.copy(), profiles, source,
-                 sensor._voltage_weights.copy(), emitters, paths)
+                 sensor._voltage_weights.copy(), emitter_x0, emitters, paths)
     del grid, sensor
     gc.collect()
     return plan
@@ -171,12 +191,14 @@ def batch_metadata(config, angles=BEAMS):
 
 
 @torch.no_grad()
-def record_batch(config, permittivity, conductivity, *, device="cuda", dtype="float32", angles=BEAMS):
+def record_batch(config, permittivity, conductivity, *, device="cuda", dtype="float32", angles=BEAMS,
+                 max_parallel_beams=None):
     """Return SI receiver voltages [scene, antenna, beam, time] for full material arrays.
 
     Inputs have shape [scene, X, Y, Z] including vacuum PML cells. Permittivity
     is relative and conductivity is in S/m. All scenes share the acquisition
-    configuration. Each scene and beam has independent fields and PML history.
+    configuration. max_parallel_beams limits the number of independent field
+    and PML states resident per scene. All beams use the same acquisition clock.
     """
     if dtype in (torch.float32, "float32", np.float32, np.dtype("float32")):
         dtype = torch.float32
@@ -189,7 +211,15 @@ def record_batch(config, permittivity, conductivity, *, device="cuda", dtype="fl
         raise ValueError("BatchFDTD supports CPU and CUDA devices")
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("BatchFDTD needs a CUDA-enabled PyTorch build and GPU for device='cuda'")
+    if max_parallel_beams is not None and (
+        not isinstance(max_parallel_beams, (int, np.integer)) or isinstance(max_parallel_beams, bool)
+        or max_parallel_beams < 1
+    ):
+        raise ValueError("max_parallel_beams must be a positive integer")
     shape = tuple(config.grid_shape)
+    volume = int(np.prod(shape))
+    if 3 * volume >= 2**31:
+        raise ValueError("Reduce the spatial dimensions for this solver")
     eps = torch.as_tensor(permittivity, dtype=dtype, device=device)
     sig = torch.as_tensor(conductivity, dtype=dtype, device=device)
     if eps.ndim != 4 or tuple(eps.shape[1:]) != shape or sig.shape != eps.shape or eps.shape[0] < 1:
@@ -211,22 +241,47 @@ def record_batch(config, permittivity, conductivity, *, device="cuda", dtype="fl
     loss = 0.5 * plan.courant * inverse * sig * config.spacing * eta0
     decay = ((1 - loss) / (1 + loss)).contiguous()
     drive = (plan.courant * inverse / (1 + loss)).contiguous()
-    beams, antennas = plan.source.shape[1:]
     scenes = eps.shape[0]
     del eps, sig, inverse, loss
+    beams, antennas = plan.source.shape[1:]
+    concurrent = min(max_parallel_beams or beams, beams)
+    if scenes * concurrent > 65535:
+        raise ValueError("Reduce the scene batch size or max_parallel_beams for this solver")
+    if concurrent == beams:
+        return _record_beams(plan, config, plan.source, decay, drive)
+    traces = np.empty((scenes, antennas, beams, config.samples_per_shot),
+                      dtype=np.float64 if dtype == torch.float64 else np.float32)
+    for start in range(0, beams, concurrent):
+        group = slice(start, start + concurrent)
+        traces[:, :, group, :] = _record_beams(plan, config, plan.source[:, group], decay, drive)
+    return traces
+
+
+def _record_beams(plan, config, source, decay, drive):
+    shape = tuple(config.grid_shape)
+    scenes = decay.shape[0]
+    beams, antennas = source.shape[1:]
     shots = scenes * beams
     volume = int(np.prod(shape))
-    if shots > 65535 or 3 * volume >= 2**31:
-        raise ValueError("Split the scene batch or reduce the spatial dimensions for this solver")
-    settings = {"dtype": dtype, "device": device}
+    pml = config.pml_thickness
+    device = decay.device
+    settings = {"dtype": decay.dtype, "device": device}
     fields = torch.zeros((2, shots, 3, volume), **settings)
-    histories = torch.zeros((2, shots, 6, volume), **settings)
+    # Each derivative axis needs history only on its two boundary slabs.
+    # Offsets count cells before storing the two tangential components.
+    nx, ny, nz = shape
+    slab_offsets = [0]
+    for face_area in (ny * nz, nx * nz, nx * ny):
+        slab_offsets.append(slab_offsets[-1] + 2 * pml * face_area)
+    histories = torch.zeros((2, shots, 2 * slab_offsets[-1]), **settings)
     profiles, source, weights = (torch.as_tensor(a, **settings).contiguous()
-                                 for a in (plan.profiles, plan.source, plan.weights))
+                                 for a in (plan.profiles, source, plan.weights))
     emitters, paths = (torch.as_tensor(a, device=device).contiguous() for a in (plan.emitters, plan.paths))
     output = torch.empty((scenes, beams, antennas, config.samples_per_shot), **settings)
     layout = _Layout(*shape, scenes, beams, antennas, plan.paths.shape[1], config.samples_per_shot,
-                     plan.metadata["sample_stride"], plan.courant, (ctypes.c_double * 3)(*plan.direction))
+                     plan.metadata["sample_stride"], pml, plan.emitter_x0, plan.emitter_x0 + plan.emitters.shape[0],
+                     (ctypes.c_size_t * 4)(*slab_offsets),
+                     plan.courant, (ctypes.c_double * 3)(*plan.direction))
     arrays = (fields[0], fields[1], histories[0], histories[1], decay, drive, profiles,
               source, weights, emitters, paths, output)
     buffers = _Buffers(*(a.data_ptr() for a in arrays))

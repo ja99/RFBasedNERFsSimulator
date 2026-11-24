@@ -86,9 +86,12 @@ def rasterize(config, origin, objects):
     return labels
 
 
-def generate(root, *, scenes, seed, start_index, material, objects, batch_size, device, dtype):
+def generate(root, *, scenes, seed, start_index, material, objects, batch_size, device, dtype,
+             max_parallel_beams=None):
     if min(scenes, batch_size) <= 0 or min(start_index, seed) < 0:
         raise ValueError("Scene and batch counts must be positive and seeds and indices nonnegative")
+    if max_parallel_beams is not None and max_parallel_beams < 1:
+        raise ValueError("max_parallel_beams must be positive")
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     config = configuration(material)
@@ -125,7 +128,8 @@ def generate(root, *, scenes, seed, start_index, material, objects, batch_size, 
     if not pending:
         return
     empty_eps = np.ones((1, *config.grid_shape), dtype=dtype)
-    empty = record_batch(config, empty_eps, np.zeros_like(empty_eps), device=device, dtype=dtype)[0]
+    solver_options = dict(device=device, dtype=dtype, max_parallel_beams=max_parallel_beams)
+    empty = record_batch(config, empty_eps, np.zeros_like(empty_eps), **solver_options)[0]
     acquisition_json = json.dumps(metadata, indent=2) + "\n"
     started = monotonic()
     for offset in range(0, len(pending), batch_size):
@@ -139,7 +143,7 @@ def generate(root, *, scenes, seed, start_index, material, objects, batch_size, 
             eps[(b, *region)] = labels[..., 0]
             sigma[(b, *region)] = labels[..., 1]
             batch.append((labels, truth))
-        shots = record_batch(config, eps, sigma, device=device, dtype=dtype)
+        shots = record_batch(config, eps, sigma, **solver_options)
         for i, shot, (labels, truth) in zip(indices, shots, batch):
             with TemporaryDirectory(prefix=".acquiring-", dir=root) as scratch:
                 folder = Path(scratch) / "scene"
@@ -162,6 +166,8 @@ if __name__ == "__main__":
     parser.add_argument("--material", choices=MATERIALS, default="dielectric")
     parser.add_argument("--objects", type=int, choices=(1, 2), default=1)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--max-parallel-beams", type=int,
+                        help="Limit simultaneous beams per scene to reduce field memory (default: all)")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--depth-output", type=Path, help="Also write pinhole depth frames for the requested scenes")

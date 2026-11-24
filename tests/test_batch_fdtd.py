@@ -5,6 +5,7 @@ PYTHONPATH=. python tests/test_batch_fdtd.py --compare --device cuda --fixture b
 to print per-beam relative errors, peak waveform errors and elapsed times as JSON.
 """
 import argparse
+from dataclasses import replace
 import json
 import os
 import sys
@@ -21,7 +22,7 @@ from SDF import Sphere
 from WorldObjectType import WorldObject
 
 
-def reference_pair(config, epsilon, sigma, center=(13., 10., 10.), radius=2.25, timings=None):
+def reference_pair(config, epsilon, sigma, center=(13., 10., 10.), radius=2.25, timings=None, angles=BEAMS):
     fdtd.set_backend("numpy")
     sphere = WorldObject(Sphere(np.array(center), radius), epsilon, sigma)
     grid, runs = _layout(config, [sphere], n_objects=1, n_jobs=1)
@@ -31,9 +32,9 @@ def reference_pair(config, epsilon, sigma, center=(13., 10., 10.), radius=2.25, 
     eps[1, occupied] = grid[..., 0][occupied]
     sig[1, occupied] = grid[..., 1][occupied]
     start = perf_counter()
-    vacuum, metadata = _record_shots(config, (), BEAMS)
+    vacuum, metadata = _record_shots(config, (), angles)
     split = perf_counter()
-    material, _ = _record_shots(config, runs, BEAMS)
+    material, _ = _record_shots(config, runs, angles)
     if timings is not None:
         timings.update(vacuum_s=split - start, material_s=perf_counter() - split)
     return eps, sig, np.stack([vacuum, material]), metadata
@@ -78,6 +79,24 @@ class BatchFDTDTests(unittest.TestCase):
         self.assertLess(relative_per_beam(actual, expected).max(), 5e-12)
         self.assertLess(relative_per_beam(actual[1:] - actual[:1], expected[1:] - expected[:1]).max(), 5e-9)
 
+    def test_rectangular_thin_pml_matches_reference(self):
+        # Unequal face areas and an off-centre scatterer expose slab-stride aliases.
+        # One cell also exercises the pinned solver's inactive endpoint coefficients.
+        angles = ((17., -23.), (-11., 29.))
+        for thickness in (1, 2):
+            config = AcquisitionConfig(grid_shape=(17, 19, 23), pml_thickness=thickness,
+                                       standoff_cells=2, elements_per_side=2, pitch_cells=3,
+                                       grid_spacing_m=.00625, samples_per_shot=96)
+            eps, sig, expected, metadata = reference_pair(config, 3.5, .04, center=(11., 7., 14.),
+                                                          radius=2.25, angles=angles)
+            self.assertEqual(batch_metadata(config, angles), metadata)
+            for device in (("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)):
+                with self.subTest(thickness=thickness, device=device):
+                    actual = record_batch(config, eps, sig, angles=angles, device=device, dtype="float64")
+                    np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-10)
+                    self.assertLess(relative_per_beam(actual[1:] - actual[:1],
+                                                      expected[1:] - expected[:1]).max(), 5e-10)
+
     def test_without_pml_and_duplicate_shots(self):
         config = AcquisitionConfig(grid_shape=(16, 18, 19), pml_thickness=0, standoff_cells=2,
                                    pitch_cells=2, elements_per_side=2, grid_spacing_m=.00625, samples_per_shot=90)
@@ -88,6 +107,21 @@ class BatchFDTDTests(unittest.TestCase):
         np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-10)
         np.testing.assert_array_equal(actual[:, 0], actual[:, 2])
 
+    def test_beam_chunks_preserve_full_acquisition_timing_and_order(self):
+        config = replace(self.config, samples_per_shot=53)
+        angles = ((0., 0.), (47., 30.), (-15., 7.))
+        # Computing the sample stride separately per chunk would change the
+        # broadside shot's receiver times and make its echoes incompatible.
+        self.assertEqual(batch_metadata(config, angles[:1])["sample_stride"], 2)
+        self.assertEqual(batch_metadata(config, angles)["sample_stride"], 3)
+        for device in (("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)):
+            args = dict(angles=angles, device=device, dtype="float64")
+            full = record_batch(config, self.eps, self.sig, **args)
+            for limit in (1, 2):
+                with self.subTest(device=device, max_parallel_beams=limit):
+                    chunked = record_batch(config, self.eps, self.sig, max_parallel_beams=limit, **args)
+                    np.testing.assert_array_equal(chunked, full)
+
     def test_reject_invalid_dense_materials(self):
         eps = self.eps.copy()
         eps[0, 0, 10, 10] = 2.
@@ -97,6 +131,9 @@ class BatchFDTDTests(unittest.TestCase):
             record_batch(self.config, eps[0], self.sig[0], device="cpu")
         with self.assertRaisesRegex(ValueError, "positive"):
             record_batch(self.config, self.eps, -self.sig, device="cpu")
+        for limit in (0, -1):
+            with self.subTest(max_parallel_beams=limit), self.assertRaises(ValueError):
+                record_batch(self.config, self.eps, self.sig, device="cpu", max_parallel_beams=limit)
 
 
 def compare():

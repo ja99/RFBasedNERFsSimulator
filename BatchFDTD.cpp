@@ -11,7 +11,8 @@
 #endif
 
 struct Layout {
-    int nx, ny, nz, scenes, beams, antennas, path_length, samples, stride;
+    int nx, ny, nz, scenes, beams, antennas, path_length, samples, stride, pml, emitter_x0, emitter_x1;
+    std::size_t slab_offsets[4];
     double courant, direction[3];
 };
 
@@ -23,8 +24,9 @@ struct Buffers {
 };
 
 template<typename T, bool electric, int axis>
-CELL void derivative(const T* field, T* history, const T* profiles, int shot, int cell,
-                     int coord, int extent, int offset, int volume, int profile_width,
+CELL void derivative(const Layout& g, const T* field, T* history, const T* profiles,
+                     int shot, int cell, int x, int y, int z, int coord, int extent,
+                     int offset, int volume, int profile_width,
                      T& first, T& second) {
     constexpr int tangent1 = (axis + 1) % 3;
     constexpr int tangent2 = (axis + 2) % 3;
@@ -41,8 +43,15 @@ CELL void derivative(const T* field, T* history, const T* profiles, int shot, in
     const T c = profiles[base + profile_width];
     if (c != T(0)) {
         const T b = profiles[base];
-        T* h1 = history + (std::size_t(shot) * 6 + 2 * axis) * volume + cell;
-        T* h2 = h1 + volume;
+        // Pack the low and high face together along their normal axis.
+        // Each axis keeps independent histories where two or three slabs overlap.
+        const int depth = coord < g.pml ? coord : coord - extent + 2 * g.pml;
+        int slab_cell;
+        if constexpr (axis == 0) slab_cell = (depth * g.ny + y) * g.nz + z;
+        if constexpr (axis == 1) slab_cell = (x * (2 * g.pml) + depth) * g.nz + z;
+        if constexpr (axis == 2) slab_cell = (x * g.ny + y) * (2 * g.pml) + depth;
+        T* h1 = history + 2 * (shot * g.slab_offsets[3] + g.slab_offsets[axis]) + slab_cell;
+        T* h2 = h1 + (g.slab_offsets[axis + 1] - g.slab_offsets[axis]);
         *h1 = b * *h1 + c * first;
         *h2 = b * *h2 + c * second;
         first += *h1;
@@ -51,11 +60,8 @@ CELL void derivative(const T* field, T* history, const T* profiles, int shot, in
 }
 
 template<typename T, bool electric>
-CELL void update_cell(const Layout& g, const Buffers& a, int shot, int cell, int step) {
+CELL void update_cell(const Layout& g, const Buffers& a, int shot, int cell, int x, int y, int z, int step) {
     const int volume = g.nx * g.ny * g.nz;
-    const int x = cell / (g.ny * g.nz);
-    const int yz = cell - x * (g.ny * g.nz);
-    const int y = yz / g.nz, z = yz - y * g.nz;
     const int max_xy = g.nx > g.ny ? g.nx : g.ny;
     const int width = max_xy > g.nz ? max_xy : g.nz;
     const std::size_t field_base = std::size_t(shot) * 3 * volume;
@@ -64,11 +70,11 @@ CELL void update_cell(const Layout& g, const Buffers& a, int shot, int cell, int
     T* history = static_cast<T*>(electric ? a.electric_history : a.magnetic_history);
     const T* profiles = static_cast<const T*>(a.profiles);
     T xy, xz, yz_diff, yx, zx, zy;
-    derivative<T,electric,0>(source_field, history, profiles, shot, cell, x, g.nx,
+    derivative<T,electric,0>(g, source_field, history, profiles, shot, cell, x, y, z, x, g.nx,
                              g.ny * g.nz, volume, width, xy, xz);
-    derivative<T,electric,1>(source_field, history, profiles, shot, cell, y, g.ny,
+    derivative<T,electric,1>(g, source_field, history, profiles, shot, cell, x, y, z, y, g.ny,
                              g.nz, volume, width, yz_diff, yx);
-    derivative<T,electric,2>(source_field, history, profiles, shot, cell, z, g.nz,
+    derivative<T,electric,2>(g, source_field, history, profiles, shot, cell, x, y, z, z, g.nz,
                              1, volume, width, zx, zy);
     const T curl[3] = {yz_diff - zy, zx - xz, xy - yx};
     if constexpr (electric) {
@@ -77,8 +83,9 @@ CELL void update_cell(const Layout& g, const Buffers& a, int shot, int cell, int
         const T drive = static_cast<const T*>(a.drive)[material];
         for (int k = 0; k < 3; ++k)
             out[k * volume] = decay * out[k * volume] + drive * curl[k];
-        const int antenna = a.emitters[cell];
-        if (antenna >= 0) {
+        if (x >= g.emitter_x0 && x < g.emitter_x1) {
+            const int antenna = a.emitters[cell - g.emitter_x0 * g.ny * g.nz];
+            if (antenna < 0) return;
             const std::size_t index = (std::size_t(step) * g.beams + shot % g.beams) * g.antennas + antenna;
             const T pulse = static_cast<const T*>(a.source)[index];
             for (int k = 0; k < 3; ++k)
@@ -109,7 +116,12 @@ CELL void receive(const Layout& g, const Buffers& a, int shot, int antenna, int 
 template<typename T, bool electric>
 __global__ void half_step(Layout g, Buffers a, int step) {
     const int cell = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cell < g.nx * g.ny * g.nz) update_cell<T,electric>(g, a, blockIdx.y, cell, step);
+    if (cell < g.nx * g.ny * g.nz) {
+        const int x = cell / (g.ny * g.nz);
+        const int yz = cell - x * (g.ny * g.nz);
+        const int y = yz / g.nz, z = yz - y * g.nz;
+        update_cell<T,electric>(g, a, blockIdx.y, cell, x, y, z, step);
+    }
 }
 
 template<typename T>
@@ -117,6 +129,17 @@ __global__ void gather(Layout g, Buffers a, int sample) {
     const int trace = blockIdx.x * blockDim.x + threadIdx.x;
     if (trace < g.scenes * g.beams * g.antennas)
         receive<T>(g, a, trace / g.antennas, trace % g.antennas, sample);
+}
+#else
+template<typename T, bool electric>
+void half_step(const Layout& g, const Buffers& a, int shot, int step) {
+    for (int x = 0; x < g.nx; ++x) {
+        for (int y = 0; y < g.ny; ++y) {
+            const int row = (x * g.ny + y) * g.nz;
+            for (int z = 0; z < g.nz; ++z)
+                update_cell<T,electric>(g, a, shot, row + z, x, y, z, step);
+        }
+    }
 }
 #endif
 
@@ -139,8 +162,8 @@ int simulate(const Layout& g, const Buffers& a, void* stream_ptr) {
     #pragma omp parallel for num_threads(threads) schedule(static)
     for (int shot = 0; shot < shots; ++shot) {
         for (int step = 0; step < steps; ++step) {
-            for (int cell = 0; cell < volume; ++cell) update_cell<T,true>(g, a, shot, cell, step);
-            for (int cell = 0; cell < volume; ++cell) update_cell<T,false>(g, a, shot, cell, step);
+            half_step<T,true>(g, a, shot, step);
+            half_step<T,false>(g, a, shot, step);
             if (step % g.stride == 0)
                 for (int ant = 0; ant < g.antennas; ++ant) receive<T>(g, a, shot, ant, step / g.stride);
         }
